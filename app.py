@@ -7,10 +7,15 @@ serve from that log rather than re-scanning on every request.
 
     uvicorn app:app --reload --port 8005
     curl http://localhost:8005/alerts?limit=20
-    curl -X POST http://localhost:8005/admin/scan
+    ADMIN_TOKEN=... uvicorn app:app --port 8005   # enable admin routes
+    curl -X POST http://localhost:8005/admin/scan -H "X-Admin-Token: $ADMIN_TOKEN"
 
 Set NOTIFIER_WEBHOOK_URL to also fan alerts out to Slack/Discord on every
 scheduled scan (see notifier.py) — leave unset to log to file only.
+
+Security env vars:
+  ADMIN_TOKEN       shared secret for /admin/*; unset => admin routes disabled.
+  ALLOWED_ORIGINS   comma-separated CORS allowlist; unset => "*" (dev only).
 """
 
 from __future__ import annotations
@@ -18,9 +23,11 @@ from __future__ import annotations
 import json
 import os
 
+import secrets
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.notifier import ConsoleNotifier, FileNotifier, MultiNotifier, WebhookNotifier
@@ -30,6 +37,21 @@ from run_screener import DEFAULT_BASKET
 TICKERS = os.environ.get("SCREENER_TICKERS", ",".join(DEFAULT_BASKET)).split(",")
 SCAN_HOUR = int(os.environ.get("SCREENER_SCAN_HOUR", "6"))  # 6am server time, before market open
 LOG_PATH = os.environ.get("SCREENER_LOG_PATH", "alerts_log.jsonl")
+
+# Comma-separated allowlist of browser origins, e.g. "https://thesis.jeremyxiang.com".
+# Falls back to "*" for local dev; set it in production to lock the API to your frontend.
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+
+# Shared secret guarding the /admin/* endpoints. Unset => admin routes are disabled
+# (fail closed) so a manual scan can never be triggered by an anonymous caller.
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")
+
+
+def _require_admin(token: str | None) -> None:
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=503, detail="Admin endpoints disabled: set ADMIN_TOKEN to enable them.")
+    if not token or not secrets.compare_digest(token, ADMIN_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Admin-Token.")
 
 scheduler = BackgroundScheduler()
 
@@ -61,7 +83,7 @@ async def _lifespan(app_: FastAPI):
 
 
 app = FastAPI(title="Screener Alerts API", version="1.0", lifespan=_lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/health")
@@ -89,7 +111,8 @@ def get_alerts(limit: int = 50, severity: str | None = None, ticker: str | None 
 
 
 @app.post("/admin/scan")
-def trigger_scan():
+def trigger_scan(x_admin_token: str | None = Header(default=None)):
+    _require_admin(x_admin_token)
     notifier = _build_notifier()
     alerts = scan_and_notify(TICKERS, notifier)
     return {"alerts_fired": len(alerts)}
